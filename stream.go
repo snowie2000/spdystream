@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/spdystream/spdy"
@@ -20,11 +21,14 @@ type Stream struct {
 	streamId  spdy.StreamId
 	parent    *Stream
 	conn      *Connection
+	active    bool
 	startChan chan error
 
-	dataLock sync.RWMutex
-	dataChan chan []byte
-	unread   []byte
+	dataLock        sync.RWMutex
+	dataChan        chan []byte
+	writePermission chan bool
+	dataChanCount   int32
+	unread          []byte
 
 	priority   uint8
 	headers    http.Header
@@ -35,6 +39,7 @@ type Stream struct {
 	replied    bool
 	closeLock  sync.Mutex
 	closeChan  chan bool
+	windowSize uint32
 }
 
 // WriteData writes data to stream, sending a dataframe per call
@@ -57,6 +62,13 @@ func (s *Stream) WriteData(data []byte, fin bool) error {
 		StreamId: s.streamId,
 		Flags:    flags,
 		Data:     data,
+	}
+
+	select {
+	case <-s.conn.closeChan:
+		return io.EOF
+	case <-s.writePermission:
+		s.writePermission <- true
 	}
 
 	debugMessage("(%p) (%d) Writing data frame", s, s.streamId)
@@ -85,6 +97,11 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 				return 0, io.EOF
 			}
 			s.unread = read
+			if atomic.AddInt32(&s.dataChanCount, -1) < DATA_CHANNEL_RESUME && !s.active {
+				s.conn.updateWindowSize(s.streamId, DATA_CHANNEL_RESUME)
+				s.active = true
+			}
+
 		}
 	}
 	n = copy(p, s.unread)

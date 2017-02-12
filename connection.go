@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/spdystream/spdy"
@@ -20,8 +22,10 @@ var (
 )
 
 const (
-	FRAME_WORKERS = 5
-	QUEUE_SIZE    = 50
+	FRAME_WORKERS          = 5
+	QUEUE_SIZE             = 50
+	DATA_CHANNEL_THRESHOLD = 10
+	DATA_CHANNEL_RESUME    = 5
 )
 
 type StreamHandler func(stream *Stream)
@@ -360,6 +364,9 @@ Loop:
 			priority = 0
 			partition = partitionRoundRobin
 			partitionRoundRobin = (partitionRoundRobin + 1) % FRAME_WORKERS
+		case *spdy.WindowUpdateFrame:
+			priority = s.getStreamPriority(frame.StreamId)
+			partition = int(frame.StreamId % FRAME_WORKERS)
 		case *spdy.GoAwayFrame:
 			// hold on to the go away frame and exit the loop
 			goAwayFrame = frame
@@ -393,6 +400,14 @@ Loop:
 	s.streamCond.L.Unlock()
 }
 
+func (s *Connection) updateWindowSize(id spdy.StreamId, size uint32) {
+	frame := &spdy.WindowUpdateFrame{
+		StreamId:        id,
+		DeltaWindowSize: size,
+	}
+	s.framer.WriteFrame(frame)
+}
+
 func (s *Connection) frameHandler(frameQueue *PriorityFrameQueue, newHandler StreamHandler) {
 	for {
 		popFrame := frameQueue.Pop()
@@ -416,6 +431,8 @@ func (s *Connection) frameHandler(frameQueue *PriorityFrameQueue, newHandler Str
 			frameErr = s.handlePingFrame(frame)
 		case *spdy.GoAwayFrame:
 			frameErr = s.handleGoAwayFrame(frame)
+		case *spdy.WindowUpdateFrame:
+			frameErr = s.handleWindowUpdateFrame(frame)
 		default:
 			frameErr = fmt.Errorf("unhandled frame type: %T", frame)
 		}
@@ -441,17 +458,21 @@ func (s *Connection) addStreamFrame(frame *spdy.SynStreamFrame) {
 	}
 
 	stream := &Stream{
-		streamId:   frame.StreamId,
-		parent:     parent,
-		conn:       s,
-		startChan:  make(chan error),
-		headers:    frame.Headers,
-		finished:   (frame.CFHeader.Flags & spdy.ControlFlagUnidirectional) != 0x00,
-		replyCond:  sync.NewCond(new(sync.Mutex)),
-		dataChan:   make(chan []byte),
-		headerChan: make(chan http.Header),
-		closeChan:  make(chan bool),
-		priority:   frame.Priority,
+		streamId:        frame.StreamId,
+		parent:          parent,
+		conn:            s,
+		active:          true,
+		startChan:       make(chan error),
+		writePermission: make(chan bool, 1),
+		headers:         frame.Headers,
+		finished:        (frame.CFHeader.Flags & spdy.ControlFlagUnidirectional) != 0x00,
+		replyCond:       sync.NewCond(new(sync.Mutex)),
+		dataChan:        make(chan []byte, 50),
+		dataChanCount:   0,
+		headerChan:      make(chan http.Header),
+		closeChan:       make(chan bool),
+		priority:        frame.Priority,
+		windowSize:      DATA_CHANNEL_THRESHOLD,
 	}
 	if frame.CFHeader.Flags&spdy.ControlFlagFin != 0x00 {
 		stream.closeRemoteChannels()
@@ -539,6 +560,34 @@ func (s *Connection) handleResetFrame(frame *spdy.RstStreamFrame) error {
 	return nil
 }
 
+func (s *Connection) handleWindowUpdateFrame(frame *spdy.WindowUpdateFrame) error {
+	stream, streamOk := s.getStream(frame.StreamId)
+	if !streamOk {
+		// Stream has already gone away
+		return nil
+	}
+	if !stream.replied {
+		// No reply received...Protocol error?
+		return nil
+	}
+
+	select {
+	case <-stream.closeChan:
+		return nil
+	default:
+	}
+	log.Printf("stream %d, window size %d\n", stream.streamId, frame.DeltaWindowSize)
+
+	if frame.DeltaWindowSize == 0 && stream.windowSize != 0 {
+		<-stream.writePermission //disable write
+	}
+	if frame.DeltaWindowSize != 0 && stream.windowSize == 0 {
+		stream.writePermission <- true //enable write
+	}
+	stream.windowSize = frame.DeltaWindowSize
+	return nil
+}
+
 func (s *Connection) handleHeaderFrame(frame *spdy.HeadersFrame) error {
 	stream, streamOk := s.getStream(frame.StreamId)
 	if !streamOk {
@@ -586,6 +635,11 @@ func (s *Connection) handleDataFrame(frame *spdy.DataFrame) error {
 			debugMessage("(%p) (%d) Data frame not sent (stream shut down)", stream, stream.streamId)
 		case stream.dataChan <- frame.Data:
 			debugMessage("(%p) (%d) Data frame sent", stream, stream.streamId)
+			if atomic.AddInt32(&stream.dataChanCount, 1) > DATA_CHANNEL_THRESHOLD && stream.active {
+				// send windows update frame to stop sending
+				s.updateWindowSize(stream.streamId, 0)
+				stream.active = false
+			}
 		}
 		stream.dataLock.RUnlock()
 	}
@@ -658,14 +712,18 @@ func (s *Connection) CreateStream(headers http.Header, parent *Stream, fin bool)
 	}
 
 	stream := &Stream{
-		streamId:   streamId,
-		parent:     parent,
-		conn:       s,
-		startChan:  make(chan error),
-		headers:    headers,
-		dataChan:   make(chan []byte),
-		headerChan: make(chan http.Header),
-		closeChan:  make(chan bool),
+		streamId:        streamId,
+		parent:          parent,
+		conn:            s,
+		active:          true,
+		startChan:       make(chan error),
+		writePermission: make(chan bool, 1),
+		headers:         headers,
+		dataChan:        make(chan []byte, 50),
+		dataChanCount:   0,
+		headerChan:      make(chan http.Header),
+		closeChan:       make(chan bool),
+		windowSize:      DATA_CHANNEL_THRESHOLD,
 	}
 
 	debugMessage("(%p) (%p) Create stream", s, stream)
@@ -915,6 +973,7 @@ func (s *Connection) validateStreamId(rid spdy.StreamId) error {
 }
 
 func (s *Connection) addStream(stream *Stream) {
+	stream.writePermission <- true
 	s.streamCond.L.Lock()
 	s.streams[stream.streamId] = stream
 	debugMessage("(%p) (%p) Stream added, broadcasting: %d", s, stream, stream.streamId)
