@@ -102,7 +102,9 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 			if atomic.AddInt32(&s.dataChanCount, -1) < DATA_CHANNEL_RESUME && !s.active {
 				s.conn.updateWindowSize(s.streamId, DATA_CHANNEL_RESUME)
 				s.active = true
+				debugMessage("sid %d, resume", s.streamId)
 			}
+			debugMessage("sid %d, queue %d\n", s.streamId, s.dataChanCount)
 
 		}
 	}
@@ -188,15 +190,17 @@ func (s *Stream) Close() error {
 
 // Reset sends a reset frame, putting the stream into the fully closed state.
 func (s *Stream) Reset() error {
+	s.conn.removeStream(s)
+	e := s.resetStream()
+DRAIN:
 	for {
 		select {
 		case <-s.dataChan: //drain all unread data
 		default:
-			break
+			break DRAIN
 		}
 	}
-	s.conn.removeStream(s)
-	return s.resetStream()
+	return e
 }
 
 func (s *Stream) resetStream() error {

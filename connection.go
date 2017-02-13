@@ -365,7 +365,7 @@ Loop:
 			partition = partitionRoundRobin
 			partitionRoundRobin = (partitionRoundRobin + 1) % FRAME_WORKERS
 		case *spdy.WindowUpdateFrame:
-			priority = s.getStreamPriority(frame.StreamId)
+			priority = 0
 			partition = int(frame.StreamId % FRAME_WORKERS)
 		case *spdy.GoAwayFrame:
 			// hold on to the go away frame and exit the loop
@@ -467,7 +467,7 @@ func (s *Connection) addStreamFrame(frame *spdy.SynStreamFrame) {
 		headers:         frame.Headers,
 		finished:        (frame.CFHeader.Flags & spdy.ControlFlagUnidirectional) != 0x00,
 		replyCond:       sync.NewCond(new(sync.Mutex)),
-		dataChan:        make(chan []byte, 50),
+		dataChan:        make(chan []byte, 500),
 		dataChanCount:   0,
 		headerChan:      make(chan http.Header),
 		closeChan:       make(chan bool),
@@ -637,9 +637,11 @@ func (s *Connection) handleDataFrame(frame *spdy.DataFrame) error {
 			debugMessage("(%p) (%d) Data frame sent", stream, stream.streamId)
 			if atomic.AddInt32(&stream.dataChanCount, 1) > DATA_CHANNEL_THRESHOLD && stream.active {
 				// send windows update frame to stop sending
+				debugMessage("sid %d, stop", stream.streamId)
 				s.updateWindowSize(stream.streamId, 0)
 				stream.active = false
 			}
+			debugMessage("sid %d, queue %d\n", stream.streamId, stream.dataChanCount)
 		}
 		stream.dataLock.RUnlock()
 	}
@@ -719,7 +721,7 @@ func (s *Connection) CreateStream(headers http.Header, parent *Stream, fin bool)
 		startChan:       make(chan error),
 		writePermission: make(chan bool, 1),
 		headers:         headers,
-		dataChan:        make(chan []byte, 50),
+		dataChan:        make(chan []byte, 500),
 		dataChanCount:   0,
 		headerChan:      make(chan http.Header),
 		closeChan:       make(chan bool),
