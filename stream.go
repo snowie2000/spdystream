@@ -67,6 +67,8 @@ func (s *Stream) WriteData(data []byte, fin bool) error {
 	select {
 	case <-s.conn.closeChan:
 		return io.EOF
+	case <-s.closeChan:
+		return io.EOF
 	case <-s.writePermission:
 		s.writePermission <- true
 	}
@@ -128,6 +130,10 @@ func (s *Stream) ReadData() ([]byte, error) {
 		if !ok {
 			return nil, io.EOF
 		}
+		if atomic.AddInt32(&s.dataChanCount, -1) < DATA_CHANNEL_RESUME && !s.active {
+			s.conn.updateWindowSize(s.streamId, DATA_CHANNEL_RESUME)
+			s.active = true
+		}
 		return read, nil
 	}
 }
@@ -182,6 +188,13 @@ func (s *Stream) Close() error {
 
 // Reset sends a reset frame, putting the stream into the fully closed state.
 func (s *Stream) Reset() error {
+	for {
+		select {
+		case <-s.dataChan: //drain all unread data
+		default:
+			break
+		}
+	}
 	s.conn.removeStream(s)
 	return s.resetStream()
 }
