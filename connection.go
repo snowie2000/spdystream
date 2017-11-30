@@ -24,7 +24,7 @@ var (
 const (
 	FRAME_WORKERS          = 5
 	QUEUE_SIZE             = 50
-	DATA_CHANNEL_THRESHOLD = 10
+	DATA_CHANNEL_THRESHOLD = 50
 	DATA_CHANNEL_RESUME    = 5
 )
 
